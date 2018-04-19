@@ -1,487 +1,445 @@
 import React, { Component } from 'react';
 import PropTypes from 'prop-types';
 import {
+  Animated,
   Dimensions,
+  Easing,
   InteractionManager,
   Modal,
+  StyleSheet,
   TouchableWithoutFeedback,
   View,
 } from 'react-native';
-import rfcIsEqual from 'react-fast-compare';
 import {
   Point,
   Size,
   Rect,
-  swapSizeDimmensions,
-  makeChildlessRect,
-  computeCenterGeometry,
   computeTopGeometry,
   computeBottomGeometry,
   computeLeftGeometry,
   computeRightGeometry,
 } from './geom';
-import styleGenerator from './styles';
-import TooltipChildrenContext from './tooltip-children.context';
+import styles from './styles';
 
-export { TooltipChildrenContext };
+const { height: SCREEN_HEIGHT, width: SCREEN_WIDTH } = Dimensions.get('window');
 
-const DEFAULT_DISPLAY_INSETS = {
-  top: 24,
-  bottom: 24,
-  left: 24,
-  right: 24,
-};
-
-const computeDisplayInsets = insetsFromProps =>
-  Object.assign({}, DEFAULT_DISPLAY_INSETS, insetsFromProps);
-
-const invertPlacement = placement => {
-  switch (placement) {
-    case 'top':
-      return 'bottom';
-    case 'bottom':
-      return 'top';
-    case 'right':
-      return 'left';
-    case 'left':
-      return 'right';
-    default:
-      return placement;
-  }
-};
+const DEFAULT_ARROW_SIZE = new Size(16, 7);
+const DEFAULT_DISPLAY_AREA = new Rect(24, 24, SCREEN_WIDTH - 48, SCREEN_HEIGHT - 48);
 
 class Tooltip extends Component {
-  static defaultProps = {
-    allowChildInteraction: true,
-    arrowSize: new Size(16, 8),
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    childContentSpacing: 4,
-    children: null,
-    closeOnChildInteraction: true,
-    closeOnContentInteraction: true,
-    content: <View />,
-    displayInsets: {},
-    disableShadow: false,
-    isVisible: false,
-    onClose: () => {
-      console.warn(
-        '[react-native-walkthrough-tooltip] onClose prop not provided',
-      );
-    },
-    placement: 'center', // falls back to "top" if there ARE children
-    showChildInTooltip: true,
-    supportedOrientations: ['portrait', 'landscape'],
-    useInteractionManager: false,
-    useReactNativeModal: true,
-    topAdjustment: 0,
-    accessible: true,
-  };
-
-  static propTypes = {
-    allowChildInteraction: PropTypes.bool,
-    arrowSize: PropTypes.shape({
-      height: PropTypes.number,
-      width: PropTypes.number,
-    }),
-    backgroundColor: PropTypes.string,
-    childContentSpacing: PropTypes.number,
-    children: PropTypes.oneOfType([PropTypes.node, PropTypes.func]),
-    closeOnChildInteraction: PropTypes.bool,
-    closeOnContentInteraction: PropTypes.bool,
-    content: PropTypes.oneOfType([PropTypes.node, PropTypes.func]),
-    displayInsets: PropTypes.shape({
-      top: PropTypes.number,
-      bottom: PropTypes.number,
-      left: PropTypes.number,
-      right: PropTypes.number,
-    }),
-    disableShadow: PropTypes.bool,
-    isVisible: PropTypes.bool,
-    onClose: PropTypes.func,
-    placement: PropTypes.oneOf(['top', 'left', 'bottom', 'right', 'center']),
-    showChildInTooltip: PropTypes.bool,
-    supportedOrientations: PropTypes.arrayOf(PropTypes.string),
-    useInteractionManager: PropTypes.bool,
-    useReactNativeModal: PropTypes.bool,
-    topAdjustment: PropTypes.number,
-    accessible: PropTypes.bool,
-  };
-
   constructor(props) {
     super(props);
 
-    const { isVisible, useInteractionManager } = props;
-
-    this.isMeasuringChild = false;
-    this.interactionPromise = null;
-    this.dimensionsSubscription = null;
-
-    this.childWrapper = React.createRef();
     this.state = {
-      // no need to wait for interactions if not visible initially
-      waitingForInteractions: isVisible && useInteractionManager,
-      contentSize: new Size(0, 0),
-      adjustedContentSize: new Size(0, 0),
-      anchorPoint: new Point(0, 0),
-      tooltipOrigin: new Point(0, 0),
-      childRect: new Rect(0, 0, 0, 0),
-      displayInsets: computeDisplayInsets(props.displayInsets),
-      // if we have no children, and place the tooltip at the "top" we want it to
-      // behave like placement "bottom", i.e. display below the top of the screen
-      placement:
-        React.Children.count(props.children) === 0
-          ? invertPlacement(props.placement)
-          : props.placement,
-      measurementsFinished: false,
-      windowDims: Dimensions.get('window'),
+      contentSize: {},
+      anchorPoint: {},
+      popoverOrigin: {},
+      childRect: {},
+      placement: 'auto',
+      isTransitioning: false,
+      isAwaitingShow: props.isVisible,
+      readyToComputeGeom: false,
+      waitingToComputeGeom: false,
+      defaultAnimatedValues: {
+        scale: new Animated.Value(0),
+        translate: new Animated.ValueXY(),
+        fade: new Animated.Value(0),
+      },
     };
   }
 
-  componentDidMount() {
-    this.dimensionsSubscription = Dimensions.addEventListener(
-      'change',
-      this.updateWindowDims,
-    );
-  }
+  componentWillReceiveProps(nextProps) {
+    const willBeVisible = nextProps.isVisible;
+    const { isVisible } = this.props;
 
-  componentDidUpdate(prevProps, prevState) {
-    const { content, isVisible, placement } = this.props;
-    const { displayInsets } = this.state;
+    if (willBeVisible !== isVisible) {
+      if (willBeVisible) {
+        // We want to start the show animation only when contentSize is known
+        // so that we can have some logic depending on the geometry
+        this.setState({ contentSize: {}, isAwaitingShow: true });
 
-    const contentChanged = !rfcIsEqual(prevProps.content, content);
-    const placementChanged = prevProps.placement !== placement;
-    const becameVisible = isVisible && !prevProps.isVisible;
-    const insetsChanged = !rfcIsEqual(prevState.displayInsets, displayInsets);
-
-    if (contentChanged || placementChanged || becameVisible || insetsChanged) {
-      setTimeout(() => {
-        this.measureChildRect();
-      });
-    }
-  }
-
-  componentWillUnmount() {
-    // removeEventListener deprecated
-    // https://reactnative.dev/docs/dimensions#removeeventlistener
-    if (this.dimensionsSubscription?.remove) {
-      // react native >= 0.65.*
-      this.dimensionsSubscription.remove();
-    } else {
-      // react native < 0.65.*
-      Dimensions.removeEventListener('change', this.updateWindowDims);
-    }
-
-    if (this.interactionPromise) {
-      this.interactionPromise.cancel();
-    }
-  }
-
-  static getDerivedStateFromProps(nextProps, prevState) {
-    const nextState = {};
-
-    // update placement in state if the prop changed
-    const nextPlacement =
-      React.Children.count(nextProps.children) === 0
-        ? invertPlacement(nextProps.placement)
-        : nextProps.placement;
-
-    if (nextPlacement !== prevState.placement) {
-      nextState.placement = nextPlacement;
-    }
-
-    // update computed display insets if they changed
-    const nextDisplayInsets = computeDisplayInsets(nextProps.displayInsets);
-    if (!rfcIsEqual(nextDisplayInsets, prevState.displayInsets)) {
-      nextState.displayInsets = nextDisplayInsets;
-    }
-
-    // set measurements finished flag to false when tooltip closes
-    if (prevState.measurementsFinished && !nextProps.isVisible) {
-      nextState.measurementsFinished = false;
-      nextState.adjustedContentSize = new Size(0, 0);
-    }
-
-    if (Object.keys(nextState).length) {
-      return nextState;
-    }
-
-    return null;
-  }
-
-  updateWindowDims = dims => {
-    this.setState(
-      {
-        windowDims: dims.window,
-        contentSize: new Size(0, 0),
-        adjustedContentSize: new Size(0, 0),
-        anchorPoint: new Point(0, 0),
-        tooltipOrigin: new Point(0, 0),
-        childRect: new Rect(0, 0, 0, 0),
-        measurementsFinished: false,
-      },
-      () => {
-        setTimeout(() => {
+        // The location of the child element may have changed based on
+        // transition animations in the corresponding view, so remeasure
+        InteractionManager.runAfterInteractions(() => {
           this.measureChildRect();
-        }, 500); // give the rotation a moment to finish
-      },
-    );
+        });
+      } else {
+        this._startAnimation({ show: false });
+      }
+    }
+  }
+
+  getArrowSize = placement => {
+    const size = this.props.arrowSize;
+    switch (placement) {
+      case 'left':
+      case 'right':
+        return new Size(size.height, size.width);
+      default:
+        return size;
+    }
   };
 
-  doChildlessPlacement = () => {
-    this.onChildMeasurementComplete(
-      makeChildlessRect({
-        displayInsets: this.state.displayInsets,
-        placement: this.state.placement, // MUST use from state, not props
-        windowDims: this.state.windowDims,
-      }),
-    );
+  getArrowColorStyle = color => {
+    return { borderTopColor: color };
   };
 
-  measureContent = e => {
-    const { width, height } = e.nativeEvent.layout;
-    const contentSize = new Size(width, height);
-    this.setState({ contentSize }, () => {
-      this.computeGeometry();
-    });
+  getArrowRotation = placement => {
+    switch (placement) {
+      case 'bottom':
+        return '180deg';
+      case 'left':
+        return '-90deg';
+      case 'right':
+        return '90deg';
+      default:
+        return '0deg';
+    }
   };
 
-  onChildMeasurementComplete = rect => {
-    this.setState(
-      {
-        childRect: rect,
-        waitingForInteractions: false,
-      },
-      () => {
-        this.isMeasuringChild = false;
-        if (this.state.contentSize.width) {
-          this.computeGeometry();
-        }
-      },
-    );
+  getArrowDynamicStyle = () => {
+    const { anchorPoint, popoverOrigin } = this.state;
+    const arrowSize = this.props.arrowSize;
+
+    // Create the arrow from a rectangle with the appropriate borderXWidth set
+    // A rotation is then applied dependending on the placement
+    // Also make it slightly bigger
+    // to fix a visual artifact when the popover is animated with a scale
+    const width = arrowSize.width + 2;
+    const height = arrowSize.height * 2 + 2;
+
+    return {
+      left: anchorPoint.x - popoverOrigin.x - width / 2,
+      top: anchorPoint.y - popoverOrigin.y - height / 2,
+      width,
+      height,
+      borderTopWidth: height / 2,
+      borderRightWidth: width / 2,
+      borderBottomWidth: height / 2,
+      borderLeftWidth: width / 2,
+    };
+  };
+
+  getTranslateOrigin = () => {
+    const { contentSize, popoverOrigin, anchorPoint } = this.state;
+    const popoverCenter = new Point(popoverOrigin.x + contentSize.width / 2,
+      popoverOrigin.y + contentSize.height / 2);
+    return new Point(anchorPoint.x - popoverCenter.x, anchorPoint.y - popoverCenter.y);
+  };
+
+  measureContent = x => {
+    const { width, height } = x.nativeEvent.layout;
+    const contentSize = { width, height };
+
+    if (!this.state.readyToComputeGeom) {
+      this.setState({
+        waitingToComputeGeom: true,
+        contentSize,
+      });
+    } else {
+      this._doComputeGeometry({ contentSize });
+    }
   };
 
   measureChildRect = () => {
-    const doMeasurement = () => {
-      if (!this.isMeasuringChild) {
-        this.isMeasuringChild = true;
-        if (
-          this.childWrapper.current &&
-          typeof this.childWrapper.current.measure === 'function'
-        ) {
-          this.childWrapper.current.measure(
-            (x, y, width, height, pageX, pageY) => {
-              const childRect = new Rect(pageX, pageY, width, height);
-              if (
-                Object.values(childRect).every(value => value !== undefined)
-              ) {
-                this.onChildMeasurementComplete(childRect);
-              } else {
-                this.doChildlessPlacement();
-              }
-            },
-          );
-        } else {
-          this.doChildlessPlacement();
+    this.childWrapper.measureInWindow((x, y, width, height) => {
+      this.setState({
+        childRect: { x, y, width, height },
+        readyToComputeGeom: true,
+      },
+        () => {
+          const { contentSize, waitingToComputeGeom } = this.state;
+          if (waitingToComputeGeom) {
+            this._doComputeGeometry({ contentSize });
+          } else if (contentSize.width !== null) {
+            this._updateGeometry({ contentSize });
+          }
         }
-      }
+      );
+    });
+  };
+
+  _doComputeGeometry = ({ contentSize }) => {
+    const geom = this.computeGeometry({ contentSize });
+    const { popoverOrigin, anchorPoint, placement } = geom;
+
+    this.setState({
+      contentSize,
+      popoverOrigin,
+      anchorPoint,
+      placement,
+      readyToComputeGeom: undefined,
+      waitingToComputeGeom: false,
+    },
+      () => this._startAnimation({ show: true })
+    );
+  }
+
+  _updateGeometry = ({ contentSize }) => {
+    const geom = this.computeGeometry({ contentSize });
+    const { popoverOrigin, anchorPoint, placement } = geom;
+
+    this.setState({
+      popoverOrigin,
+      anchorPoint,
+      placement,
+    });
+  }
+
+  computeGeometry = ({ contentSize, placement }) => {
+    const innerPlacement = placement || this.props.placement;
+
+    const options = {
+      displayArea: this.props.displayArea,
+      childRect: this.state.childRect,
+      arrowSize: this.getArrowSize(innerPlacement),
+      contentSize,
     };
 
-    if (this.props.useInteractionManager) {
-      if (this.interactionPromise) {
-        this.interactionPromise.cancel();
-      }
-      this.interactionPromise = InteractionManager.runAfterInteractions(() => {
-        doMeasurement();
-      });
-    } else {
-      doMeasurement();
+    switch (innerPlacement) {
+      case 'top':
+        return computeTopGeometry(options);
+      case 'bottom':
+        return computeBottomGeometry(options);
+      case 'left':
+        return computeLeftGeometry(options);
+      case 'right':
+        return computeRightGeometry(options);
+      default:
+        return this.computeAutoGeometry(options);
     }
   };
 
-  computeGeometry = () => {
-    const { arrowSize, childContentSpacing } = this.props;
-    const {
-      childRect,
-      contentSize,
-      displayInsets,
-      placement,
-      windowDims,
-    } = this.state;
+  computeAutoGeometry = ({ displayArea, contentSize }) => {
+    // prefer top, so check that first. if none 'work', fall back to top
+    const placementsToTry = ['top', 'bottom', 'left', 'right', 'top'];
 
-    const options = {
-      displayInsets,
-      childRect,
-      windowDims,
-      arrowSize:
-        placement === 'top' || placement === 'bottom'
-          ? arrowSize
-          : swapSizeDimmensions(arrowSize),
-      contentSize,
-      childContentSpacing,
-    };
+    let geom;
+    for (let i = 0; i < placementsToTry.length; i++) {
+      const placement = placementsToTry[i];
 
-    let geom = computeTopGeometry(options);
+      geom = this.computeGeometry({ contentSize, placement });
+      const { popoverOrigin } = geom;
 
-    // special case for centered, childless placement tooltip
-    if (
-      placement === 'center' &&
-      React.Children.count(this.props.children) === 0
-    ) {
-      geom = computeCenterGeometry(options);
-    } else {
-      switch (placement) {
-        case 'bottom':
-          geom = computeBottomGeometry(options);
-          break;
-        case 'left':
-          geom = computeLeftGeometry(options);
-          break;
-        case 'right':
-          geom = computeRightGeometry(options);
-          break;
-        case 'top':
-        default:
-          break; // computed just above if-else-block
+      if (popoverOrigin.x >= displayArea.x
+        && popoverOrigin.x <= displayArea.x + displayArea.width - contentSize.width
+        && popoverOrigin.y >= displayArea.y
+        && popoverOrigin.y <= displayArea.y + displayArea.height - contentSize.height) {
+        break;
       }
     }
 
-    const { tooltipOrigin, anchorPoint, adjustedContentSize } = geom;
+    return geom;
+  };
 
-    this.setState({
-      tooltipOrigin,
-      anchorPoint,
-      placement,
-      measurementsFinished: childRect.width && contentSize.width,
-      adjustedContentSize,
+  _startAnimation = ({ show }) => {
+    this._startDefaultAnimation({ show, callback: () => this.setState({ isTransitioning: false }) });
+    this.setState({ isTransitioning: true });
+  };
+
+  _startDefaultAnimation = ({ show, callback }) => {
+    const animDuration = 300;
+    const values = this.state.defaultAnimatedValues;
+    const translateOrigin = this.getTranslateOrigin();
+
+    if (show) {
+      values.translate.setValue(translateOrigin);
+    }
+
+    const commonConfig = {
+      duration: animDuration,
+      easing: show ? Easing.out(Easing.back()) : Easing.inOut(Easing.quad),
+    };
+
+    Animated.parallel([
+      Animated.timing(values.fade, {
+        toValue: show ? 1 : 0,
+        ...commonConfig,
+      }),
+      Animated.timing(values.translate, {
+        toValue: show ? new Point(0, 0) : translateOrigin,
+        ...commonConfig,
+      }),
+      Animated.timing(values.scale, {
+        toValue: show ? 1 : 0,
+        ...commonConfig,
+      }),
+    ]).start(callback);
+  };
+
+  _getDefaultAnimatedStyles = () => {
+    const animatedValues = this.state.defaultAnimatedValues;
+
+    return {
+      backgroundStyle: {
+        opacity: animatedValues.fade,
+      },
+      arrowStyle: {
+        transform: [
+          {
+            scale: animatedValues.scale.interpolate({
+              inputRange: [0, 1],
+              outputRange: [0, 1],
+              extrapolate: 'clamp',
+            }),
+          },
+        ],
+      },
+      contentStyle: {
+        transform: [
+          { translateX: animatedValues.translate.x },
+          { translateY: animatedValues.translate.y },
+          { scale: animatedValues.scale },
+        ],
+      },
+    };
+  };
+
+  _getExtendedStyles = () => {
+    const background = [];
+    const popover = [];
+    const arrow = [];
+    const content = [];
+
+    const animatedStyles = this.props.animated ? this._getDefaultAnimatedStyles() : null;
+
+    [animatedStyles, this.props].forEach(source => {
+      if (source) {
+        background.push(source.backgroundStyle);
+        popover.push(source.popoverStyle);
+        arrow.push(source.arrowStyle);
+        content.push(source.contentStyle);
+      }
     });
+
+    return {
+      background,
+      popover,
+      arrow,
+      content,
+    };
   };
 
   renderChildInTooltip = () => {
     const { height, width, x, y } = this.state.childRect;
+    const { onElementPress, onElementLongPress } = this.props;
+    const wrapInTouchable =
+      typeof onElementPress === 'function' ||
+      typeof onElementLongPress === 'function';
 
-    const onTouchEnd = () => {
-      if (this.props.closeOnChildInteraction) {
-        this.props.onClose();
-      }
-    };
+    const childElement = (
+      <View
+        pointerEvents={wrapInTouchable ? 'box-only' : 'auto'}
+        style={{
+          position: 'absolute',
+          height,
+          width,
+          top: y,
+          left: x,
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        {this.props.children}
+      </View>
+    );
+
+    if (wrapInTouchable) {
+      return (
+        <TouchableWithoutFeedback onPress={onElementPress} onLongPress={onElementLongPress}>
+          {childElement}
+        </TouchableWithoutFeedback>
+      );
+    }
+
+    return childElement;
+  }
+
+  render() {
+    if (!this.props.children) {
+      return null;
+    }
+
+    const { popoverOrigin, placement } = this.state;
+
+    const extendedStyles = this._getExtendedStyles();
+    const contentStyle = [styles.content, ...extendedStyles.content];
+    const arrowColor = StyleSheet.flatten(contentStyle).backgroundColor;
+    const arrowColorStyle = this.getArrowColorStyle(arrowColor);
+    const arrowDynamicStyle = this.getArrowDynamicStyle();
+    const contentSizeAvailable = this.state.contentSize.width;
+
+    // Special case, force the arrow rotation even if it was overriden
+    let arrowStyle = [styles.arrow, arrowDynamicStyle, arrowColorStyle, ...extendedStyles.arrow];
+    const arrowTransform = (StyleSheet.flatten(arrowStyle).transform || []).slice(0);
+    arrowTransform.unshift({ rotate: this.getArrowRotation(placement) });
+    arrowStyle = [...arrowStyle, { transform: arrowTransform }];
 
     return (
-      <TooltipChildrenContext.Provider value={{ tooltipDuplicate: true }}>
+      <View>
+        {/* This renders the tooltip fullscreen popover */}
+        <Modal
+          transparent
+          visible={this.props.isVisible}
+          onRequestClose={this.props.onClose}
+        >
+          <TouchableWithoutFeedback onPress={this.props.onClose}>
+            <View style={[styles.container, contentSizeAvailable && styles.containerVisible]}>
+              <Animated.View style={[styles.background, ...extendedStyles.background]} />
+              <Animated.View
+                style={[styles.popover, {
+                  top: popoverOrigin.y,
+                  left: popoverOrigin.x,
+                }, ...extendedStyles.popover]}
+              >
+                <Animated.View style={arrowStyle} />
+                <Animated.View
+                  onLayout={this.measureContent}
+                  style={contentStyle}
+                >
+                  {this.props.content}
+                </Animated.View>
+              </Animated.View>
+              {this.renderChildInTooltip()}
+            </View>
+          </TouchableWithoutFeedback>
+        </Modal>
+
+        {/* This renders the child element where it is in the parent's layout */}
         <View
-          onTouchEnd={onTouchEnd}
-          pointerEvents={this.props.allowChildInteraction ? 'box-none' : 'none'}
-          style={[
-            {
-              position: 'absolute',
-              height,
-              width,
-              top: y,
-              left: x,
-              alignItems: 'center',
-              justifyContent: 'center',
-            },
-            this.props.childrenWrapperStyle,
-          ]}
+          ref={r => { this.childWrapper = r; }}
+          onLayout={this.measureChildRect}
         >
           {this.props.children}
         </View>
-      </TooltipChildrenContext.Provider>
-    );
-  };
-
-  renderContentForTooltip = () => {
-    const generatedStyles = styleGenerator({
-      adjustedContentSize: this.state.adjustedContentSize,
-      anchorPoint: this.state.anchorPoint,
-      arrowSize: this.props.arrowSize,
-      displayInsets: this.state.displayInsets,
-      measurementsFinished: this.state.measurementsFinished,
-      ownProps: { ...this.props },
-      placement: this.state.placement,
-      tooltipOrigin: this.state.tooltipOrigin,
-      topAdjustment: this.props.topAdjustment,
-    });
-
-    const hasChildren = React.Children.count(this.props.children) > 0;
-
-    const onPressContent = () => {
-      if (this.props.closeOnContentInteraction) {
-        this.props.onClose();
-      }
-    };
-
-    return (
-      <TouchableWithoutFeedback
-        onPress={this.props.onClose}
-        accessible={this.props.accessible}
-      >
-        <View style={generatedStyles.containerStyle}>
-          <View style={[generatedStyles.backgroundStyle]}>
-            <View style={generatedStyles.tooltipStyle}>
-              {hasChildren ? <View style={generatedStyles.arrowStyle} /> : null}
-              <View
-                onLayout={this.measureContent}
-                style={generatedStyles.contentStyle}
-              >
-                <TouchableWithoutFeedback
-                  onPress={onPressContent}
-                  accessible={this.props.accessible}
-                >
-                  {this.props.content}
-                </TouchableWithoutFeedback>
-              </View>
-            </View>
-          </View>
-          {hasChildren && this.props.showChildInTooltip
-            ? this.renderChildInTooltip()
-            : null}
-        </View>
-      </TouchableWithoutFeedback>
-    );
-  };
-
-  render() {
-    const {
-      children,
-      isVisible,
-      useReactNativeModal,
-      modalComponent,
-    } = this.props;
-
-    const hasChildren = React.Children.count(children) > 0;
-    const showTooltip = isVisible && !this.state.waitingForInteractions;
-    const ModalComponent = modalComponent || Modal;
-
-    return (
-      <React.Fragment>
-        {useReactNativeModal ? (
-          <ModalComponent
-            transparent
-            visible={showTooltip}
-            onRequestClose={this.props.onClose}
-            supportedOrientations={this.props.supportedOrientations}
-          >
-            {this.renderContentForTooltip()}
-          </ModalComponent>
-        ) : null}
-
-        {/* This renders the child element in place in the parent's layout */}
-        {hasChildren ? (
-          <View
-            ref={this.childWrapper}
-            onLayout={this.measureChildRect}
-            style={this.props.parentWrapperStyle}
-          >
-            {children}
-          </View>
-        ) : null}
-
-        {!useReactNativeModal && showTooltip
-          ? this.renderContentForTooltip()
-          : null}
-      </React.Fragment>
+      </View>
     );
   }
 }
+
+Tooltip.defaultProps = {
+  animated: false,
+  arrowSize: DEFAULT_ARROW_SIZE,
+  content: () => { },
+  displayArea: DEFAULT_DISPLAY_AREA,
+  isVisible: false,
+  onClose: () => { },
+  onElementLongPress: null,
+  onElementPress: null,
+  placement: 'auto',
+};
+
+Tooltip.propTypes = {
+  animated: PropTypes.bool,
+  arrowSize: PropTypes.object,
+  content: PropTypes.element,
+  displayArea: PropTypes.any,
+  isVisible: PropTypes.bool,
+  onElementLongPress: PropTypes.func,
+  onElementPress: PropTypes.func,
+  onClose: PropTypes.func,
+  placement: PropTypes.string,
+  children: PropTypes.element,
+};
 
 export default Tooltip;
